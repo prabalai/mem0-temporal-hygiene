@@ -112,6 +112,27 @@ Alternatively, use the cron-friendly wrapper that stays silent unless anomalies 
 
 ---
 
+## 📊 Memory Contradiction & Lifecycle Benchmark (`MemoryAudit`)
+
+The repository includes a simulation-based benchmark suite (`scripts/memory-audit.py`) designed to evaluate memory system accuracy across the contradiction taxonomy proposed by the community.
+
+### Contradiction Taxonomy Tested
+- **Class A: Direct Inversions** (e.g. enabling vs disabling a preference like dark mode / notification settings).
+- **Class B: Soft Overrides** (e.g. changing configuration specifiers such as host ports or paths).
+- **Class C: Legitimate Coexistence** (e.g. additive preferences like liking both classical and jazz music).
+
+### How to Run
+Run the benchmark directly from the repository line:
+```bash
+python3 scripts/memory-audit.py
+```
+
+This tests the isolated detection (Stage 2) and resolution (Stage 3) logic of the validity overlay framework:
+- **Stage 2 (Detection):** Ensures conflicts and duplicates are recognized under negation/toggle keywords.
+- **Stage 3 (Resolution):** Validates deterministic merges and verifies that compatible configurations coexist while contradictory variables are superseded.
+
+---
+
 ## 📝 Configuration
 
 The engine reads your existing `~/.hermes/mem0_oss.json` configuration config. Fill in your LLM and Qdrant details:
