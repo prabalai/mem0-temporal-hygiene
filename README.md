@@ -72,6 +72,13 @@ If a new memory has a similarity of `0.92` to an existing one but contains anton
 ### 4. Hash-Based Cluster Cache
 The periodic hygiene script hashes semantic clusters by content and point IDs. If a cluster has not changed, the engine reuses the previous merge decision, cutting down LLM API token consumption by up to 90%.
 
+### 5. Obsidian Bidirectional Sync (Master of Truth)
+Synchronizes memories in real-time between the SQLite database and an Obsidian Vault:
+- **Durable YAML Frontmatter:** YAML metadata tracks entity nodes, state keys, trust tiers, and dynamic decay parameters.
+- **Loop & Infinite Sync Protection:** Using `last_synced_hash`, the engine identifies whether file revisions are automated or manual, preventing infinite write loops.
+- **WebDAV Integrations:** Note transactions are automatically configured with `664` system permissions for smooth WebDAV server sync.
+- **Sandbox Boundary Checks:** Rejects traversal attacks (e.g. `/../../etc/passwd`) by enforcing strict vault path prefixes.
+
 ---
 
 ## 🚀 Quick Start in 60 Seconds

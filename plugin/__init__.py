@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def _default_config() -> dict:
     return {
-        "llm_model": "hermes-nvidia-fast",
+        "llm_model": "AgentCron",
         "llm_base_url": "http://localhost:20130/v1",
         "llm_api_key": os.environ.get("OPENAI_API_KEY", "sk-hermes-admin"),
         "embedder_provider": "openai",
@@ -63,7 +63,7 @@ def _clip_text(text: str, limit: int) -> str:
 
 
 
-MEMORY_SCHEMA_VERSION = "2026-06-05-write-guard-v1"
+MEMORY_SCHEMA_VERSION = "2026-06-11-mfs-write-guard-v2"
 NEGATION_RE = re.compile(
     r"\b(не|нет|никогда|запрет|запрещ|не надо|no|not|never|disable|disabled|off|without|avoid|don't|do not)\b",
     re.IGNORECASE,
@@ -128,6 +128,71 @@ def _calculate_temporal_decay(created_at_str: str, source: str) -> float:
         return 1.0
 
 
+def _ensure_optimized_collection(cfg: dict) -> None:
+    import urllib.request
+    import urllib.error
+    import json
+    
+    collection_name = cfg.get("collection_name")
+    if not collection_name:
+        return
+        
+    host = cfg.get("qdrant_host", "localhost")
+    port = cfg.get("qdrant_port", 6333)
+    url = f"http://{host}:{port}/collections/{collection_name}"
+    
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            # Collection exists
+            return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            logger.warning("Qdrant get collection error: %s", e)
+            return
+    except Exception as e:
+        logger.warning("Qdrant connection wrapper error: %s", e)
+        return
+        
+    # Collection does not exist, create it with optimized settings
+    logger.info("Pre-creating optimized Qdrant collection: %s", collection_name)
+    dims = cfg.get("embedding_dims") or 1024
+    create_body = {
+        "vectors": {
+            "size": dims,
+            "distance": "Cosine",
+            "on_disk": True
+        },
+        "hnsw_config": {
+            "on_disk": True
+        },
+        "quantization_config": {
+            "scalar": {
+                "type": "int8",
+                "quantile": 0.99,
+                "always_ram": True
+            }
+        }
+    }
+    create_body["sparse_vectors"] = {
+        "bm25": {
+            "modifier": "idf"
+        }
+    }
+    
+    try:
+        req_create = urllib.request.Request(
+            url,
+            data=json.dumps(create_body).encode('utf-8'),
+            headers={"Content-Type": "application/json"},
+            method="PUT"
+        )
+        with urllib.request.urlopen(req_create, timeout=5) as resp:
+            logger.info("Pre-created collection response: %s", resp.read().decode('utf-8').strip())
+    except Exception as e:
+        logger.error("Failed to pre-create optimized Qdrant collection %s: %s", collection_name, e)
+
+
 def _fingerprint(text: str) -> str:
     return hashlib.sha256((text or "").strip().lower().encode("utf-8")).hexdigest()[:16]
 
@@ -180,7 +245,13 @@ PROFILE_SCHEMA = {
         "Получить все факты о пользователе из долгосрочной памяти (Mem0 OSS self-hosted). "
         "Вызывай в начале разговора чтобы понять кто это."
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "mfs_path": {"type": "string", "description": "Ограничить выборку конкретным путем MFS (например, /user/preferences/music/)."}
+        },
+        "required": []
+    },
 }
 
 SEARCH_SCHEMA = {
@@ -194,6 +265,7 @@ SEARCH_SCHEMA = {
         "properties": {
             "query": {"type": "string", "description": "Что искать."},
             "top_k": {"type": "integer", "description": "Сколько результатов (default 5, max 20)."},
+            "mfs_path": {"type": "string", "description": "Ограничить поиск конкретным путем MFS (например, /user/preferences/music/)."}
         },
         "required": ["query"],
     },
@@ -280,17 +352,168 @@ class Mem0OSSProvider(MemoryProvider):
                 return self._memory
             from mem0 import Memory
             self._cfg = _load_config()
+            _ensure_optimized_collection(self._cfg)
             self._memory = Memory.from_config(_build_mem0_config(self._cfg))
             return self._memory
 
-    def _get_active_filters(self) -> dict:
-        return {
+    # -- MFS path taxonomy: ordered (most-specific first) rule table --
+    _MFS_RULES: list[tuple[list[str], str]] = [
+        # /user/preferences/*
+        (["music", "jazz", "lo-fi", "песн", "джаз", "музык", "петь", "плейлист", "playlist", "spotify"], "/user/preferences/music/"),
+        (["food", "еда", "кухня", "рецепт", "готов", "вегетар", "cuisine", "recipe", "cook"], "/user/preferences/food/"),
+        (["lang", "язык", "locale", "локал", "english", "русск"], "/user/preferences/language/"),
+        (["theme", "dark mode", "light mode", "тема", "оформлен", "шрифт", "font"], "/user/preferences/ui/"),
+        (["hates", "prefers", "style", "любит", "не любит", "предпочитает", "стиль", "привычк"], "/user/preferences/style/"),
+        # /user/health/
+        (["здоров", "health", "лекарств", "медиц", "врач", "doctor", "аллерг", "allerg", "диагноз", "diagnosis"], "/user/health/"),
+        # /user/schedule/
+        (["wake", "sleep", "schedule", "утра", "вечера", "подъем", "график", "расписание", "routine", "рутин"], "/user/schedule/"),
+        # /user/contacts/
+        (["contact", "контакт", "телефон", "phone", "email", "почта", "адрес", "address"], "/user/contacts/"),
+        # /family/*
+        (["семь", "family", "ребён", "дет", "child", "жена", "wife", "муж", "husband", "родител", "parent"], "/family/"),
+        # /projects/*
+        (["проект", "project", "repo", "репо", "github", "gitlab", "sprint", "спринт", "задач", "task", "канбан", "kanban"], "/projects/"),
+        # /system/config/* (specific services first)
+        (["omniroute"], "/system/config/omniroute/"),
+        (["qdrant"], "/system/config/qdrant/"),
+        (["transmission"], "/system/config/transmission/"),
+        (["plex"], "/system/config/plex/"),
+        (["torrserver"], "/system/config/torrserver/"),
+        (["hermes"], "/system/config/hermes/"),
+        (["home assistant", " ha ", "homeassistant", "хоум ассистант"], "/system/config/homeassistant/"),
+        (["telegram", "тг ", "tg "], "/system/config/telegram/"),
+        (["obsidian"], "/system/config/obsidian/"),
+        (["nginx", "caddy", "ssl", "cert", "сертификат", "domain", "домен", "dns", "webdav"], "/system/network/"),
+        (["port", "key", "url", "порт", "ключ", "сеть", "token", "токен", "api_key", "secret"], "/system/config/"),
+        # /system/backup/
+        (["backup", "бэкап", "rclone", "rsync", "snapshot", "снэпшот", "yandex disk", "яндекс диск"], "/system/backup/"),
+        # /system/cron/
+        (["cron", "крон", "schedule job", "таймер", "systemd timer"], "/system/cron/"),
+        # /system/media/
+        (["фото", "photo", "видео", "video", "медиа", "media", "галере", "gallery", "альбом", "album"], "/system/media/"),
+        # /education/
+        (["учёб", "учеб", "школ", "school", "курс", "course", "урок", "lesson", "домашн", "homework", "экзамен", "exam"], "/education/"),
+        # /finance/
+        (["деньг", "money", "финанс", "finance", "бюджет", "budget", "расход", "expense", "доход", "income", "счёт", "invoice"], "/finance/"),
+    ]
+
+    def _extract_mfs_path(self, content: str) -> str:
+        """Extract VFS/MFS path from fact content using rules first, LLM fallback."""
+        text = (content or "").strip()
+        if not text:
+            return "/general/"
+
+        t_low = text.lower()
+
+        # 1. Rule-based fast path: scan ordered taxonomy
+        for keywords, path in self._MFS_RULES:
+            if any(kw in t_low for kw in keywords):
+                return path
+
+        # 2. LLM call fallback
+        try:
+            url = f"{self._cfg['llm_base_url']}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if self._cfg.get('llm_api_key') and self._cfg['llm_api_key'] != "***":
+                headers["Authorization"] = f"Bearer {self._cfg['llm_api_key']}"
+
+            body = {
+                "model": self._cfg["llm_model"],
+                "messages": [
+                    {
+                        "role": "system", 
+                        "content": (
+                            "You are a VFS (Virtual File System) path extractor. Classify the input text into a path "
+                            "resembling a folder structure (e.g., /user/preferences/music/, /projects/config/). "
+                            "Output ONLY the single absolute path, lowercase, with trailing slash. Do not include markdown formatting or extra words."
+                        )
+                    },
+                    {"role": "user", "content": "User listens to jazz in the morning"},
+                    {"role": "assistant", "content": "/user/preferences/music/"},
+                    {"role": "user", "content": "Dmitry hates dry updates"},
+                    {"role": "assistant", "content": "/user/preferences/style/"},
+                    {"role": "user", "content": "The backup cron script runs at 3 AM"},
+                    {"role": "assistant", "content": "/system/backup/"},
+                    {"role": "user", "content": "OmniRoute port is 20130"},
+                    {"role": "assistant", "content": "/system/config/omniroute/"},
+                    {"role": "user", "content": text}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 50,
+                "stream": False
+            }
+
+            import urllib.request
+            req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode('utf-8'))
+                raw_path = res['choices'][0]['message']['content'].strip()
+                
+                # Sanitize the output
+                path = raw_path.lower()
+                path = re.sub(r"[`'\"#\s]", "", path)
+                path = re.sub(r"^(path|vfspath|vfs|mfs):", "", path)
+                if not path.startswith("/"):
+                    path = "/" + path
+                if not path.endswith("/"):
+                    path = path + "/"
+                path = re.sub(r"/+", "/", path)
+                return path
+        except Exception as e:
+            logger.warning("LLM _extract_mfs_path failed: %s, falling back to /general/", e)
+            return "/general/"
+
+    def _get_active_filters(self, mfs_path: str = None, *, prefix_match: bool = False) -> dict:
+        """Build Qdrant payload filters.
+        
+        When prefix_match=True, the mfs_path acts as a VFS directory prefix
+        (e.g. /system/config/ matches /system/config/omniroute/ too).
+        Qdrant doesn't support native prefix, so we pass the exact path and 
+        handle prefix filtering in Python post-search.
+        """
+        filters = {
             "user_id": self._user_id,
             "NOT": [
                 {"status": "superseded"},
                 {"status": "deleted"}
             ]
         }
+        if mfs_path and not prefix_match:
+            filters["mfs_path"] = mfs_path
+        # For prefix_match we filter in Python after retrieval
+        return filters
+
+    @staticmethod
+    def _mfs_paths_related(path_a: str, path_b: str) -> bool:
+        """Check if two MFS paths share a namespace (one is prefix/ancestor of the other).
+        
+        /system/config/ is related to /system/config/omniroute/
+        /system/config/omniroute/ is related to /system/config/omniroute/
+        /user/preferences/ is NOT related to /system/config/
+        """
+        if not path_a or not path_b:
+            return True  # unknown path → conservative: assume related
+        a = path_a.rstrip("/") + "/"
+        b = path_b.rstrip("/") + "/"
+        return a.startswith(b) or b.startswith(a)
+
+    @staticmethod
+    def _mfs_paths_same_namespace(path_a: str, path_b: str) -> bool:
+        """Check if two MFS paths are in the SAME leaf namespace (exact match or siblings).
+        
+        /system/config/omniroute/ == /system/config/omniroute/ → True
+        /system/config/ vs /system/config/omniroute/ → True (parent contains child)
+        /system/config/omniroute/ vs /system/config/qdrant/ → False (different siblings)
+        /user/preferences/music/ vs /system/config/ → False
+        """
+        if not path_a or not path_b:
+            return True  # unknown → conservative
+        a = path_a.rstrip("/") + "/"
+        b = path_b.rstrip("/") + "/"
+        return a == b or a.startswith(b) or b.startswith(a)
 
     def _base_metadata(self, *, source: str = "explicit_tool", confidence: float = 0.85) -> dict:
         now = _utc_now()
@@ -306,18 +529,39 @@ class Mem0OSSProvider(MemoryProvider):
             "updated_at_client": now,
         }
 
-    def _search_write_candidates(self, m, content: str, *, top_k: int = 5) -> list[dict]:
+    def _search_write_candidates(self, m, content: str, *, mfs_path: str = None, top_k: int = 5) -> list[dict]:
+        """Search for existing facts that might conflict with a new write.
+        
+        When mfs_path is provided, we search WITHOUT path filter in Qdrant 
+        (to catch cross-namespace near-duplicates), then post-filter by MFS
+        namespace relatedness. This is the VFS-aware write guard.
+        """
         try:
             clipped = (content or "")[:800]
             if not clipped.strip():
                 return []
-            res = m.search(query=clipped, filters=self._get_active_filters(), top_k=top_k)
+            # Search broadly (no mfs_path filter) to catch cross-namespace conflicts
+            res = m.search(query=clipped, filters=self._get_active_filters(), top_k=top_k * 2)
             items = res.get("results", []) if isinstance(res, dict) else res
-            return [r for r in items if _memory_text(r)]
+            results = [r for r in items if _memory_text(r)]
+            
+            if mfs_path and results:
+                # Annotate each candidate with its mfs_path relatedness
+                for r in results:
+                    cand_meta = r.get("metadata", {}) or {}
+                    cand_path = cand_meta.get("mfs_path", "")
+                    r["_mfs_related"] = self._mfs_paths_related(mfs_path, cand_path)
+                    r["_mfs_same_ns"] = self._mfs_paths_same_namespace(mfs_path, cand_path)
+                    r["_mfs_path"] = cand_path
+                
+                # Sort: same namespace first, then related, then unrelated
+                results.sort(key=lambda x: (not x.get("_mfs_same_ns"), not x.get("_mfs_related")))
+            
+            return results[:top_k]
         except TypeError:
-            res = m.search(query=(content or "")[:800], filters=self._get_active_filters(), limit=top_k)
+            res = m.search(query=(content or "")[:800], filters=self._get_active_filters(), limit=top_k * 2)
             items = res.get("results", []) if isinstance(res, dict) else res
-            return [r for r in items if _memory_text(r)]
+            return [r for r in items if _memory_text(r)][:top_k]
         except Exception as e:
             logger.debug("mem0 write-candidate search failed: %s", e)
             return []
@@ -386,7 +630,7 @@ class Mem0OSSProvider(MemoryProvider):
     def get_config_schema(self):
         return [
             {"key": "user_id", "description": "User identifier", "default": "dmitry"},
-            {"key": "llm_model", "description": "LLM via OmniRoute", "default": "hermes-nvidia-fast"},
+            {"key": "llm_model", "description": "LLM via OmniRoute", "default": "AgentCron"},
             {"key": "llm_base_url", "description": "OmniRoute URL", "default": "http://localhost:20130/v1"},
             {"key": "embedder_model", "description": "Local embedding model", "default": "BAAI/bge-m3"},
             {"key": "qdrant_host", "description": "Qdrant host", "default": "localhost"},
@@ -474,7 +718,8 @@ class Mem0OSSProvider(MemoryProvider):
 
         if tool_name == "mem0_profile":
             try:
-                res = m.get_all(filters=self._get_active_filters())
+                mfs_path = args.get("mfs_path")
+                res = m.get_all(filters=self._get_active_filters(mfs_path))
                 items = res.get("results", []) if isinstance(res, dict) else res
                 if not items:
                     return json.dumps({"result": "Память пуста."})
@@ -485,9 +730,11 @@ class Mem0OSSProvider(MemoryProvider):
                         continue
                     created_at = r.get("created_at") or ""
                     date_prefix = f"[{created_at[:10]}] " if created_at and len(created_at) >= 10 else ""
+                    metadata = r.get("metadata", {}) or {}
+                    path_str = f" ({metadata.get('mfs_path')})" if metadata.get("mfs_path") else ""
                     mem_id = r.get("id") or ""
                     id_suffix = f" [ID: {mem_id}]" if mem_id else ""
-                    lines.append(f"{date_prefix}{mem}{id_suffix}")
+                    lines.append(f"{date_prefix}{mem}{path_str}{id_suffix}")
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)}, ensure_ascii=False)
             except Exception as e:
                 return tool_error(f"Ошибка получения профиля: {e}")
@@ -497,12 +744,13 @@ class Mem0OSSProvider(MemoryProvider):
             if not query:
                 return tool_error("Нужен параметр query")
             top_k = min(int(args.get("top_k", 5)), 20)
+            mfs_path = args.get("mfs_path")
             try:
                 # Clip search query to prevent embedding token limit errors (e.g. 512 tokens for NVIDIA NIM)
                 clipped = query[:800]
                 # Query a wider pool of candidates to allow decay re-ranking
                 search_limit = min(top_k * 3, 50)
-                res = m.search(query=clipped, filters=self._get_active_filters(), limit=search_limit)
+                res = m.search(query=clipped, filters=self._get_active_filters(mfs_path), limit=search_limit)
                 items = res.get("results", []) if isinstance(res, dict) else res
                 if not items:
                     return json.dumps({"result": "Релевантных фактов не найдено."}, ensure_ascii=False)
@@ -532,7 +780,8 @@ class Mem0OSSProvider(MemoryProvider):
                         "raw_score": sim_score,
                         "score": final_score,
                         "decay_factor": decay_factor,
-                        "confidence": confidence
+                        "confidence": confidence,
+                        "mfs_path": metadata.get("mfs_path")
                     })
                 
                 # Sort descending by updated final score
@@ -545,9 +794,10 @@ class Mem0OSSProvider(MemoryProvider):
                 for r in final_results:
                     created_at = r["created_at"]
                     date_prefix = f"[{created_at[:10]}] " if created_at and len(created_at) >= 10 else ""
+                    path_str = f" ({r['mfs_path']})" if r.get('mfs_path') else ""
                     out.append({
                         "id": r["id"],
-                        "memory": f"{date_prefix}{r['memory']}",
+                        "memory": f"{date_prefix}{r['memory']}{path_str}",
                         "score": r["score"],
                         "raw_score": r["raw_score"],
                         "created_at": created_at
@@ -563,11 +813,13 @@ class Mem0OSSProvider(MemoryProvider):
             try:
                 limit = int((self._cfg or {}).get("remember_char_limit", 900))
                 clipped_content = _clip_text(content, limit)
-                candidates = self._search_write_candidates(m, clipped_content)
+                mfs_path = self._extract_mfs_path(clipped_content)
+                candidates = self._search_write_candidates(m, clipped_content, mfs_path=mfs_path)
                 relation = self._classify_write_relation(clipped_content, candidates)
                 metadata = self._base_metadata(source="explicit_mem0_remember", confidence=0.85)
                 metadata.update(relation)
                 metadata["content_fingerprint"] = _fingerprint(clipped_content)
+                metadata["mfs_path"] = mfs_path
 
                 # Conservative write path: detect and annotate conflicts/duplicates, but let Mem0
                 # keep its normal extraction UX. We do not soft-delete or supersede anything here.
@@ -582,6 +834,7 @@ class Mem0OSSProvider(MemoryProvider):
                 return json.dumps({
                     "result": f"Сохранено {len(added)} факт(ов).",
                     "facts": [r.get("memory", "") for r in added],
+                    "mfs_path": mfs_path,
                     "write_guard": {
                         "conflict_status": relation["conflict_status"],
                         "conflicts_with": relation["conflicts_with"],
@@ -615,15 +868,18 @@ class Mem0OSSProvider(MemoryProvider):
             if not memory_id or not content:
                 return tool_error("Нужны параметры memory_id и content")
             try:
-                candidates = [c for c in self._search_write_candidates(m, content) if (c.get("id") or c.get("memory_id")) != memory_id]
+                mfs_path = self._extract_mfs_path(content)
+                candidates = [c for c in self._search_write_candidates(m, content, mfs_path=mfs_path) if (c.get("id") or c.get("memory_id")) != memory_id]
                 relation = self._classify_write_relation(content, candidates)
                 metadata = self._base_metadata(source="explicit_mem0_update", confidence=0.95)
                 metadata.update(relation)
                 metadata["content_fingerprint"] = _fingerprint(content)
                 metadata["updated_memory_id"] = memory_id
+                metadata["mfs_path"] = mfs_path
                 m.update(memory_id, content, metadata=metadata)
                 return json.dumps({
                     "result": f"Факт {memory_id} успешно обновлён.",
+                    "mfs_path": mfs_path,
                     "write_guard": {
                         "conflict_status": relation["conflict_status"],
                         "conflicts_with": relation["conflicts_with"],
