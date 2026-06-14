@@ -77,7 +77,7 @@ sys.path.insert(0, "/opt/hermes-agent")
 
 from mem0 import Memory
 
-def load_mem0_config() -> dict:
+def load_mem0_config(config_path: str = "/root/.hermes/mem0_oss.json") -> dict:
     default_cfg = {
         "llm_model": "hermes-nvidia-fast",
         "llm_base_url": "http://localhost:20130/v1",
@@ -94,10 +94,9 @@ def load_mem0_config() -> dict:
         "user_id": "139351986",
     }
     
-    path = "/root/.hermes/mem0_oss.json"
-    if os.path.exists(path):
+    if os.path.exists(config_path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
                 # Resolve masking
                 for k, v in user_cfg.items():
@@ -106,7 +105,7 @@ def load_mem0_config() -> dict:
                             user_cfg[k] = os.environ.get("OPENAI_API_KEY", "***")
                 default_cfg.update(user_cfg)
         except Exception as e:
-            logger.warning("Failed to load mem0_oss.json: %s", e)
+            logger.warning("Failed to load %s: %s", config_path, e)
             
     return default_cfg
 
@@ -364,9 +363,9 @@ No extra comments, no markdown code blocks, just raw JSON.
         logger.error("LLM group analysis failed: %s", e)
         return None
 
-def main(dry_run: bool = False):
+def main(dry_run: bool = False, config_path: str = "/root/.hermes/mem0_oss.json"):
     logger.info("Initializing Memory Hygiene Job%s...", " (dry-run/report-only)" if dry_run else "")
-    cfg = load_mem0_config()
+    cfg = load_mem0_config(config_path)
     
     # Initialize Mem0 Memory SDK
     mem0_params = build_mem0_params(cfg)
@@ -537,6 +536,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Mem0/Qdrant memory hygiene with soft-delete metadata overlay.")
     parser.add_argument("--dry-run", action="store_true", help="Report proposed updates/soft-deletes without writing to Mem0/Qdrant.")
     parser.add_argument("--report-only", action="store_true", help="Alias for --dry-run; intended for safe scheduled audits.")
+    parser.add_argument("--config", default="/root/.hermes/mem0_oss.json", help="Path to mem0_oss.json configuration file.")
     args = parser.parse_args()
     if args.report_only:
         args.dry_run = True
@@ -545,4 +545,4 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    main(dry_run=args.dry_run)
+    main(dry_run=args.dry_run, config_path=args.config)
